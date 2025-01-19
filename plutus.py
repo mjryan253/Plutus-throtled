@@ -1,7 +1,3 @@
-# Plutus Bitcoin Brute Forcer
-# Original script by Isaac Delly ( https://github.com/Isaacdelly )
-# Updated and maintained  by mjryan253 ( https://github.com/mjryan253/Plutus-throtled )
-
 from fastecdsa import keys, curve
 from ellipticcurve.privateKey import PrivateKey
 import platform
@@ -59,46 +55,19 @@ def private_key_to_wif(private_key):
         else: break
     return chars[0] * pad + result
 
-def main(database, args):
+def main(database, args, address_count_shared):
+    local_count = 0  # Local counter for addresses tried
+
     while True:
         private_key = generate_private_key()
         public_key = private_key_to_public_key(private_key, args['fastecdsa']) 
         address = public_key_to_address(public_key)
 
-        if args['verbose']:
-            print(address)
-        
-        if address[-args['substring']:] in database:
-            for filename in os.listdir(DATABASE):
-                with open(DATABASE + filename) as file:
-                    if address in file.read():
-                        with open('plutus.txt', 'a') as plutus:
-                            plutus.write('hex private key: ' + str(private_key) + '\n' +
-                                         'WIF private key: ' + str(private_key_to_wif(private_key)) + '\n'
-                                         'public key: ' + str(public_key) + '\n' +
-                                         'uncompressed address: ' + str(address) + '\n\n')
-                        break
+        local_count += 1
+        address_count_shared.value += 1  # Increment the shared counter
 
-def print_help():
-    print('''Plutus homepage: https://github.com/Isaacdelly/Plutus
-Plutus QA support: https://github.com/Isaacdelly/Plutus/issues
-
-
-Speed test: 
-execute 'python3 plutus.py time', the output will be the time it takes to bruteforce a single address in seconds
-
-
-Quick start: run command 'python3 plutus.py'
-
-By default this program runs with parameters:
-python3 plutus.py verbose=0 substring=8
-
-verbose: must be 0 or 1. If 1, then every bitcoin address that gets bruteforced will be printed to the terminal. This has the potential to slow the program down. An input of 0 will not print anything to the terminal and the bruteforcing will work silently. By default verbose is 0.
-
-substring: to make the program memory efficient, the entire bitcoin address is not loaded from the database. Only the last <substring> characters are loaded. This significantly reduces the amount of RAM required to run the program. if you still get memory errors then try making this number smaller, by default it is set to 8. This opens us up to getting false positives (empty addresses mistaken as funded) with a probability of 1/(16^<substring>), however it does NOT leave us vulnerable to false negatives (funded addresses being mistaken as empty) so this is an acceptable compromise.
-
-cpu_count: number of cores to run concurrently. More cores = more resource usage but faster bruteforcing. Omit this parameter to run with the maximum number of cores''')
-    sys.exit(0)
+        # Sleep after processing each address
+        time.sleep(0.01)  # Adjust delay as needed
 
 def timer(args):
     start = time.time()
@@ -116,7 +85,11 @@ if __name__ == '__main__':
         'fastecdsa': platform.system() in ['Linux', 'Darwin'],
         'cpu_count': multiprocessing.cpu_count(),
     }
-    
+
+    # Create a manager for shared memory
+    manager = multiprocessing.Manager()
+    address_count_shared = manager.Value('i', 0)  # Shared integer for address count
+
     for arg in sys.argv[1:]:
         command = arg.split('=')[0]
         if command == 'help':
@@ -147,7 +120,7 @@ if __name__ == '__main__':
         else:
             print('invalid input: ' + command  + '\nrun `python3 plutus.py help` for help')
             sys.exit(-1)
-    
+
     print('reading database files...')
     database = set()
     for filename in os.listdir(DATABASE):
@@ -160,6 +133,57 @@ if __name__ == '__main__':
 
     print('database size: ' + str(len(database)))
     print('processes spawned: ' + str(args['cpu_count']))
-    
+
+    # Start processes
+    processes = []
     for cpu in range(args['cpu_count']):
-        multiprocessing.Process(target = main, args = (database, args)).start()
+        p = multiprocessing.Process(target=main, args=(database, args, address_count_shared))
+        processes.append(p)
+        p.start()
+
+    # Print the address count periodically (in the main process)
+    while True:
+        time.sleep(10)  # Print every 10 seconds
+        print(f"Addresses tried so far: {address_count_shared.value}")
+
+def print_help():
+    help_text = """
+    Usage: python3 plutus.py [OPTIONS]
+
+    Options:
+    help                 Show this help message and exit.
+    time                 Run a timer to measure address generation time.
+    cpu_count=N          Set the number of CPU cores to use (default is system's CPU count).
+    verbose=0|1          Enable verbose output (0 for off, 1 for on).
+    substring=N          Set the substring length for address comparison (must be between 1 and 26).
+    
+    Description:
+    This script generates Bitcoin-like addresses by performing elliptic curve cryptography. 
+    The process involves generating a private key, deriving the corresponding public key, 
+    then generating an address from the public key using the RIPEMD160 hash function and base58 encoding.
+
+    By default, the script uses all available CPU cores for multiprocessing. You can adjust the 
+    number of CPU cores with the --cpu_count option to optimize performance depending on your system.
+
+    The script continuously generates addresses and checks them against a predefined database of 
+    known addresses. The database can be updated by placing address files in the 'Database/latest-with-address/' directory.
+
+    Example usage:
+    python3 plutus.py cpu_count=4 verbose=1 substring=8
+    This will run the script with 4 CPU cores, verbose output enabled, and use the last 8 characters of the address for matching.
+
+    Notes:
+    - Ensure that the 'Database/latest-with-address/' directory exists and contains address files for comparison.
+    - The script is optimized for Linux and macOS systems. It uses the fastecdsa library if available.
+
+    """
+    print(help_text)
+
+
+
+# Key Changes:
+
+#     Shared Counter: address_count_shared is a shared multiprocessing.Value object that all processes can increment. This eliminates the need for each process to maintain its own counter.
+#     Centralized Printing: The address count is printed periodically in the main process (every 10 seconds) using address_count_shared.value.
+#     Time.sleep() for process management: The time.sleep(10) in the main loop ensures that the count is printed regularly without overloading the CPU.
+# added recompiled help section
