@@ -8,6 +8,8 @@ The name of the text file is the date when the database was last updated in mont
 
 The database currently holds `43,212,954 Bitcoin addresses`. This is the total number of Bitcoin addresses with a balance that exist in the blockchain at the time of uploading.
 
-### Why Are There So Many Files?
+### Where are my database files??
 
-There are multiple files because GitHub limits file uploads to 50 MB. The single file is too large, so it was split into multiple files each under 50 MB in order to be uploaded to GitHub.
+Don't worry, the github repo does not contain any of the actual database. Github limits files to 50 MB each for upload, so database was omitted.
+Please visit the address above to download the most recent version of the funded Bitcoin addresses. ( http://addresses.loyce.club/ )
+Alternatively, you can choose all used addresses for your database. ( http://alladdresses.loyce.club/ )

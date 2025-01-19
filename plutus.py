@@ -1,6 +1,6 @@
 # Plutus Bitcoin Brute Forcer
-# Made by Isaac Delly
-# https://github.com/Isaacdelly/Plutus
+# Original script by Isaac Delly ( https://github.com/Isaacdelly )
+# Updated and maintained  by mjryan253 ( https://github.com/mjryan253/Plutus-throtled )
 
 from fastecdsa import keys, curve
 from ellipticcurve.privateKey import PrivateKey
@@ -12,7 +12,7 @@ import os
 import sys
 import time
 
-DATABASE = r'database/11_13_2022/'
+DATABASE = r'Database/latest-with-address/'
 
 def generate_private_key():
     return binascii.hexlify(os.urandom(32)).decode('utf-8').upper()
