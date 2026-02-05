@@ -13,3 +13,7 @@ env/
 .vscode/
 .idea/
 *.swp
+
+
+*.tar.gz
+*.bloom
