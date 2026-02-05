@@ -1,5 +1,7 @@
 coincurve
+psutil
 
-# GPU support (default run uses NVIDIA GPU + CPU when available)
+# GPU support (key production is GPU-only)
 numpy>=1.20
 pycuda>=2022.1
+pynvml

@@ -166,20 +166,6 @@ def run_build_bloom(args):
     print(f'\nSaved to {out_path}')
     print('database size: ' + str(count))
 
-def cpu_producer(queue, args):
-    """Producer: generates keys via point addition and puts (private_key_int, public_key_bytes) into queue."""
-    private_key_int = int.from_bytes(os.urandom(32), 'big')
-    current_key = CCPrivateKey(private_key_int.to_bytes(32, 'big'))
-    current_pub_key = current_key.public_key
-    while True:
-        public_key_bytes = current_pub_key.format(compressed=True)
-        try:
-            queue.put((private_key_int, public_key_bytes), block=True, timeout=3600)
-        except Exception:
-            break
-        current_pub_key = CCPublicKey.combine_keys([current_pub_key, GENERATOR_PUBLIC_KEY])
-        private_key_int += 1
-
 def write_hit(output_path, private_key_hex, wif, public_key_hex, address):
     """Append a verified hit to output_path. If path ends with .csv, write CSV row (with header if new file)."""
     is_csv = output_path.lower().endswith('.csv')
@@ -229,47 +215,6 @@ def consumer(database, queue, args, counter):
                                 break
             if found:
                 print(f"FOUND: {address}")
-
-def main(database, args, counter):
-    """Legacy CPU-only worker: generates keys and checks bloom in one process (used when --no-gpu with old-style spawn)."""
-    local_counter = 0
-    private_key_int = int.from_bytes(os.urandom(32), 'big')
-    current_key = CCPrivateKey(private_key_int.to_bytes(32, 'big'))
-    current_pub_key = current_key.public_key
-
-    while True:
-        public_key_bytes = current_pub_key.format(compressed=True)
-        address = public_key_to_address(public_key_bytes)
-
-        if args.get('verbose'):
-            print(address)
-        else:
-            local_counter += 1
-            if local_counter >= 1000:
-                with counter.get_lock():
-                    counter.value += local_counter
-                local_counter = 0
-
-        if address in database:
-            private_key_hex = hex(private_key_int)[2:].zfill(64).upper()
-            wif = str(private_key_to_wif(private_key_hex, compressed=True))
-            public_key_hex = public_key_bytes.hex().upper()
-            address_dir = args.get('address_dir') or ''
-            found = False
-            if address_dir and os.path.isdir(address_dir):
-                for filename in os.listdir(address_dir):
-                    file_path = os.path.join(address_dir, filename)
-                    if os.path.isfile(file_path):
-                        with open(file_path) as file:
-                            if address in file.read():
-                                found = True
-                                write_hit(args.get('output', 'plutus.txt'), private_key_hex, wif, public_key_hex, address)
-                                break
-            if found:
-                print(f"FOUND: {address}")
-
-        current_pub_key = CCPublicKey.combine_keys([current_pub_key, GENERATOR_PUBLIC_KEY])
-        private_key_int += 1
 
 def timer():
     start = time.time()
@@ -332,7 +277,6 @@ Examples:
   python3 plutus.py                   # Run with default settings
   python3 plutus.py -v 1              # Run with verbose output
   python3 plutus.py --cpu-count 4     # Run with 4 CPU cores
-  python3 plutus.py --no-gpu          # Use CPU-only key producer
   python3 plutus.py time              # Run speed test
   python3 plutus.py test              # Run brute-force logic test
   python3 plutus.py build-bloom --address-dir /path/to/addresses --out bloom/addresses.bloom
@@ -344,8 +288,8 @@ Examples:
     parser.add_argument('--bloom-file', type=str, default=os.environ.get('BLOOM_FILE', DEFAULT_BLOOM_FILE), help='Path to bloom filter file (default: bloom/addresses.bloom or BLOOM_FILE env)')
     parser.add_argument('--address-dir', type=str, default=None, help='Directory of address list files (for building bloom and verification on hit)')
     parser.add_argument('--out', '-o', type=str, default=None, help='Output path for build-bloom (default: --bloom-file value)')
-    parser.add_argument('--no-gpu', action='store_true', help='Use CPU-only key producer (default: try GPU if available, else CPU)')
     parser.add_argument('--output', type=str, default='plutus.txt', help='Path for verified hits (default: plutus.txt; use .csv for CSV output)')
+    parser.add_argument('--stats', action='store_true', help='Show queue depth, process CPU%%, and GPU util/memory in status line')
 
     args = parser.parse_args()
 
@@ -400,9 +344,11 @@ Examples:
     except ImportError:
         gpu_producer = None
 
-    producer_target = gpu_producer if (not args.no_gpu and gpu_producer is not None) else cpu_producer
-    producer_label = 'GPU' if producer_target is gpu_producer else 'CPU'
-    print('consumer threads: ' + str(args.cpu_count) + ', producer: ' + producer_label)
+    if gpu_producer is None:
+        print('Error: GPU producer required. Install PyCUDA and ensure an NVIDIA GPU and driver are available.')
+        sys.exit(-1)
+
+    print('consumer threads: ' + str(args.cpu_count) + ', producer: GPU')
 
     consumer_threads = []
     for _ in range(args.cpu_count):
@@ -411,8 +357,34 @@ Examples:
         t.start()
         consumer_threads.append(t)
 
-    producer_process = multiprocessing.Process(target=producer_target, args=(key_queue, args_dict))
+    producer_process = multiprocessing.Process(target=gpu_producer, args=(key_queue, args_dict))
     producer_process.start()
+
+    # Optional stats (--stats): init once, used in status loop
+    proc = None
+    nvml_handle = None
+    pynvml_mod = None
+    if args.stats:
+        try:
+            import psutil
+            proc = psutil.Process()
+            proc.cpu_percent()  # first call for baseline
+        except Exception:
+            pass
+        try:
+            import pynvml as _pynvml
+            _pynvml.nvmlInit()
+            nvml_handle = _pynvml.nvmlDeviceGetHandleByIndex(0)
+            pynvml_mod = _pynvml
+        except Exception:
+            pass
+        if proc is None or nvml_handle is None:
+            missing = []
+            if proc is None:
+                missing.append('psutil (CPU%)')
+            if nvml_handle is None:
+                missing.append('pynvml (GPU)')
+            print('Note: for full --stats, install: ' + ', '.join(missing))
 
     if not args.verbose:
         try:
@@ -421,7 +393,28 @@ Examples:
                 with counter.get_lock():
                     rate = counter.value
                     counter.value = 0
-                sys.stdout.write(f"\rSpeed: {rate} keys/sec    ")
+                segments = [f"Speed: {rate} keys/sec"]
+                if args.stats:
+                    segments.append(f"threads: {args.cpu_count}")
+                    try:
+                        qs = key_queue.qsize()
+                        segments.append(f"queue: {qs}")
+                    except (NotImplementedError, AttributeError):
+                        pass
+                    if proc is not None:
+                        try:
+                            cpu_pct = proc.cpu_percent(interval=None)
+                            segments.append(f"CPU: {cpu_pct:.0f}%")
+                        except Exception:
+                            pass
+                    if nvml_handle is not None and pynvml_mod is not None:
+                        try:
+                            util = pynvml_mod.nvmlDeviceGetUtilizationRates(nvml_handle)
+                            mem = pynvml_mod.nvmlDeviceGetMemoryInfo(nvml_handle)
+                            segments.append(f"GPU: {util.gpu}% mem: {mem.used // (1024*1024)}/{mem.total // (1024*1024)} MiB")
+                        except Exception:
+                            pass
+                sys.stdout.write("\r" + " | ".join(segments) + "    ")
                 sys.stdout.flush()
         except KeyboardInterrupt:
             print("\nShutting down...")

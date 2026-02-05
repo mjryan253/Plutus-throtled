@@ -1,0 +1,4 @@
+{"hypothesisId":"H1","location":"plutus.py:stats_init","message":"psutil init failed","data":{"error":"No module named 'psutil'"},"timestamp":1770262562085}
+{"hypothesisId":"H3","location":"plutus.py:stats_init","message":"pynvml init failed","data":{"error":"No module named 'pynvml'"},"timestamp":1770262562089}
+{"hypothesisId":"H1,H3,H4","location":"plutus.py:stats_init","message":"stats init done","data":{"proc_is_none":True,"nvml_handle_is_none":True,"cpu_count":7},"timestamp":1770262562091}
+{"hypothesisId":"H4,H5","location":"plutus.py:status_loop","message":"segments built","data":{"segments":['Speed: 10000 keys/sec', 'threads: 7', 'queue: 50000'],"consumer_thread_count":7},"timestamp":1770262563094}
