@@ -1,0 +1,9 @@
+coincurve
+psutil
+numpy>=1.20,<2
+nvidia-ml-py
+
+# PyCUDA: must work with CUDA 10.2 (last version supporting GTX 760 / Kepler).
+# Install CUDA 10.2 first, then: pip install pycuda
+# On Linux, if needed: export CUDA_PATH=/usr/local/cuda-10.2 && pip install pycuda --no-binary pycuda
+pycuda>=2019.1

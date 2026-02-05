@@ -1,0 +1,15 @@
+---
+description: Keep agent run log; append agent-history.md each run
+globs: 
+alwaysApply: true
+---
+
+# Agent history (append each run)
+
+- **agent-history.md** at the repo root is the run log for AI agents.
+- **At the end of every task or session**, append agent-history.md with a new dated section that summarizes:
+  - What was done (features, fixes, refactors)
+  - Key decisions or conventions
+  - Any troubleshooting (errors, resolutions)
+- Do not remove or overwrite past entries; only append.
+- The old workflow doc is **WSL/docs/AGENT_WORKFLOW.md**; it is legacy and should not be updated. Use agent-history.md for new run notes.
