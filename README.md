@@ -1,10 +1,28 @@
 # Plutus Bitcoin Brute Forcer
 
-Welcome to Plutus! This tool is designed to hunt for Bitcoin wallets that contain funds. It works by generating random private keys, converting them to addresses, and checking them against a database of known funded addresses.
+Welcome to Plutus! This tool hunts for Bitcoin wallets that contain funds by generating keys (GPU or CPU), deriving P2PKH addresses, and checking them against a bloom-filter database of known funded addresses. A producer process feeds key pairs into a bounded queue; CPU consumer threads check addresses against the bloom and verify hits against the address list.
 
-# Like This Project? Give It A Star
+## Quick Start
 
-[![](https://img.shields.io/github/stars/Isaacdelly/Plutus.svg)](https://github.com/Isaacdelly/Plutus)
+Run the scanner against the database with **NVIDIA GPU + CPU** (default). The producer uses the GPU when PyCUDA and the CUDA toolkit are available; otherwise the CPU producer runs. Use `--no-gpu` to force CPU-only key production.
+
+```bash
+python3 plutus.py
+```
+
+With a custom bloom file and address directory for verification on hit:
+
+```bash
+python3 plutus.py --bloom-file bloom/addresses.bloom --address-dir /path/to/address/files
+```
+
+Using the bloom file in the repo root and writing verified hits to a CSV file in the repo root:
+
+```bash
+python3 plutus.py --bloom-file addresses.bloom --output results.csv
+```
+
+You need a bloom filter file at `bloom/addresses.bloom` (or pass `--bloom-file`). If the file is missing, provide `--address-dir` so the program can build the bloom at startup. See **Bloom file** below.
 
 ## Installation
 
@@ -19,40 +37,49 @@ Welcome to Plutus! This tool is designed to hunt for Bitcoin wallets that contai
     pip3 install -r requirements.txt
     ```
 
-## Quick Start
+**Default run mode: NVIDIA GPU + CPU.** The scanner uses the GPU producer when PyCUDA and the CUDA toolkit are installed; otherwise it falls back to the CPU producer. System requirements for GPU mode:
+- **NVIDIA driver** – Must support CUDA (e.g. on WSL2 Ubuntu: install the NVIDIA driver for WSL2).
+- **CUDA toolkit** – e.g. CUDA 11.x or 12.x; required for PyCUDA. Install on the host (e.g. Ubuntu: `nvidia-cuda-toolkit` or NVIDIA’s official package).
+Run `nvidia-smi` to confirm the GPU is visible. To force CPU-only key production (e.g. when no GPU or for debugging), use `--no-gpu`.
 
-To start the brute forcer with default settings (fastest mode), simply run:
+## Bloom file
 
-```bash
-python3 plutus.py
-```
+The database of funded addresses is stored as a **bloom filter** file for fast loading. The script looks for this file at startup.
+
+- **What it is**: A pre-built filter derived from a list of Bitcoin addresses (P2PKH starting with `1`). Loading a bloom file is much faster than scanning raw address files.
+- **Default path**: `bloom/addresses.bloom` (relative to the current working directory). Override with `--bloom-file` or the `BLOOM_FILE` environment variable.
+- **How to make a bloom file**: From a directory containing one or more text files (one address per line), run:
+
+  ```bash
+  python3 plutus.py build-bloom --address-dir /path/to/address/list --out bloom/addresses.bloom
+  ```
+
+  If you omit `--out`, the path from `--bloom-file` is used. The same address list (or directory) should be passed as `--address-dir` when running the scanner so that bloom hits can be verified against the real addresses.
+
+- **Verification on hit**: When the bloom filter reports a possible match, the program confirms it by searching the address list given by `--address-dir`. Always pass `--address-dir` when running the scanner if you want hits to be verified and written to `plutus.txt`.
 
 ## How It Works
 
-1.  **Generate**: The program picks a random starting private key.
-2.  **Scan**: It uses **Elliptic Curve Point Addition** to sequentially scan keys from that starting point. This is mathematically equivalent to checking `k, k+1, k+2...` but is thousands of times faster than generating completely random keys.
-3.  **Convert**: It calculates the Bitcoin address (P2PKH) for each key.
-4.  **Check**: It instantly checks if this address is in the database of funded wallets using a Bloom Filter (a super-fast memory structure).
-5.  **Save**: If a match is found, the private key, public key, and address are saved to a file named `plutus.txt`.
+1.  **Producer** (GPU or CPU): One process generates key pairs via **Elliptic Curve Point Addition** from a random starting point (`k`, `k+1`, `k+2`...) and pushes `(private_key_int, public_key_bytes)` into a bounded queue.
+2.  **Consumers** (CPU): Multiple threads pop key pairs from the queue, derive the Bitcoin address (P2PKH) for each, and check it against the bloom filter.
+3.  **Check**: The bloom filter gives a fast possible match; the consumer then verifies against the raw address list (when `--address-dir` is set).
+4.  **Save**: If a verified match is found, the private key (hex and WIF), public key, and address are appended to `plutus.txt`.
 
 ## Speed
 
-Plutus is highly optimized for performance. It takes approximately **0.000073 seconds** to generate and check a single Bitcoin address on a modern CPU core.
-
-Because this program utilizes parallel processing, it scales linearly with your hardware. Your total throughput will be approximately:
-`CPU Cores / 0.000073` keys per second.
+Throughput is determined by the **producer** (key generation) and **consumers** (address derivation + bloom check). The producer runs in one process (GPU when `plutus_gpu` is available, otherwise CPU); multiple CPU threads consume keys from a bounded queue and check against the bloom filter. On a modern CPU core, address derivation and bloom check take on the order of **~0.000073 seconds** per key; key generation via point addition is faster. Total keys/sec depends on consumer thread count and producer speed (GPU can increase producer throughput when implemented).
 
 ## Expected Output
 
-When running normally, you will see the database loading, followed by a live speed counter:
+When running normally, you will see the bloom file loading (or building from `--address-dir`), then consumer threads and producer type, followed by a live speed counter:
 ```
-reading database files...
-Progress: 100.00%
+Loading bloom from bloom/addresses.bloom...
 DONE
-database size: 21568445
-processes spawned: 15
-Speed: 675000 keys/sec
+consumer threads: 7, producer: CPU
+Speed: 120000 keys/sec
 ```
+
+(If the `plutus_gpu` module is available and GPU is not disabled, the producer line will show `producer: GPU`.)
 
 If a wallet with money is found, it saves to `plutus.txt`:
 ```text
@@ -86,6 +113,26 @@ Shows the help menu.
 ### 5. Diagnostic Test (`test`)
 Runs a self-check to verify that the cryptographic functions (Private Key -> WIF -> Public Key -> Address) are calculating correctly.
 *   **Usage**: `python3 plutus.py test`
+
+### 6. Build bloom file (`build-bloom`)
+Builds a bloom filter file from a directory of address list files (one address per line, P2PKH addresses starting with `1`). Use this to create or refresh the database file that the scanner loads.
+*   **Usage**: `python3 plutus.py build-bloom --address-dir /path/to/addresses --out bloom/addresses.bloom`
+
+### 7. Bloom file path (`--bloom-file`)
+Path to the bloom filter file to load. Default: `bloom/addresses.bloom`, or the value of the `BLOOM_FILE` environment variable.
+*   **Usage**: `python3 plutus.py --bloom-file /path/to/addresses.bloom`
+
+### 8. Address directory (`--address-dir`)
+Directory containing raw address list files. Used to build the bloom when the bloom file is missing, and to verify bloom hits when running the scanner.
+*   **Usage**: `python3 plutus.py --address-dir /path/to/address/files`
+
+### 9. CPU-only producer (`--no-gpu`)
+Use a CPU-only key producer instead of trying the GPU. The scanner uses a bounded queue: one process produces keys (GPU if available, else CPU) and multiple CPU threads consume keys and check them against the bloom filter. Use this flag to force CPU key generation (e.g. when no GPU is present or for debugging).
+*   **Usage**: `python3 plutus.py --no-gpu`
+
+### 10. Output path (`--output`)
+Path where verified hits are appended. Default: `plutus.txt`. If the path ends with `.csv`, hits are written as CSV rows (with a header line when the file is new).
+*   **Usage**: `python3 plutus.py --output results.csv`
 
 ## Recent Improvements & TODO
 

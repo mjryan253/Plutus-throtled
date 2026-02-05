@@ -9,11 +9,16 @@ import hashlib
 import binascii
 import os
 import sys
+import struct
+import threading
 import time
 import argparse
 
-DATABASE = r'database/12_26_2025/'
+DEFAULT_BLOOM_FILE = 'bloom/addresses.bloom'
+QUEUE_MAXSIZE = 50000
 ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+BLOOM_MAGIC = b'PLUTUS_BLOOM_v1'
+BLOOM_MAGIC_LEGACY = b'PLUTBLOM'  # 8-byte legacy magic (older/alternate format)
 
 GENERATOR_PUBLIC_KEY = CCPrivateKey(int(1).to_bytes(32, 'big')).public_key
 
@@ -46,6 +51,47 @@ class BloomFilter:
             if not (self.bit_array[byte_index] & (1 << bit_index)):
                 return False
         return True
+
+    def save(self, path):
+        """Write bloom filter to a binary file (header + bit_array)."""
+        size_in_mb = len(self.bit_array) * 8 // (1024 * 1024)
+        with open(path, 'wb') as f:
+            f.write(BLOOM_MAGIC)
+            f.write(struct.pack('<II', size_in_mb, self.hash_count))
+            f.write(self.bit_array)
+
+    @classmethod
+    def load(cls, path):
+        """Load bloom filter from file. Raises ValueError if format invalid.
+        Supports current format (PLUTUS_BLOOM_v1 + 8-byte header) and legacy format (PLUTBLOM + rest as bit_array)."""
+        with open(path, 'rb') as f:
+            magic = f.read(len(BLOOM_MAGIC))
+            if magic == BLOOM_MAGIC:
+                header = f.read(8)
+                if len(header) != 8:
+                    raise ValueError('Invalid bloom file: truncated header')
+                size_in_mb, hash_count = struct.unpack('<II', header)
+                bit_array = f.read()
+                expected_bytes = size_in_mb * 1024 * 1024 // 8
+                if len(bit_array) != expected_bytes:
+                    raise ValueError(f'Invalid bloom file: expected {expected_bytes} bytes, got {len(bit_array)}')
+                obj = cls(size_in_mb=size_in_mb)
+                obj.hash_count = hash_count
+                obj.bit_array = bytearray(bit_array)
+                obj.size = len(bit_array) * 8
+                return obj
+            if magic[:len(BLOOM_MAGIC_LEGACY)] == BLOOM_MAGIC_LEGACY:
+                # Legacy format: 8-byte magic "PLUTBLOM" then remainder is raw bit_array (no size/hash header)
+                f.seek(len(BLOOM_MAGIC_LEGACY))
+                bit_array = f.read()
+                if len(bit_array) == 0:
+                    raise ValueError('Invalid bloom file: legacy format has empty bit_array')
+                obj = cls(size_in_mb=256)
+                obj.hash_count = 6
+                obj.bit_array = bytearray(bit_array)
+                obj.size = len(bit_array) * 8
+                return obj
+            raise ValueError(f'Invalid bloom file: bad magic (expected {BLOOM_MAGIC!r})')
 
 def generate_private_key():
     return binascii.hexlify(os.urandom(32)).decode('utf-8').upper()
@@ -86,24 +132,79 @@ def private_key_to_wif(private_key, compressed=True):
         else: break
     return ''.join(output[::-1])
 
-def main(database, args, counter):
-    local_counter = 0
-    
-    # Pick a random starting number
+def build_bloom_from_address_dir(address_dir, size_in_mb=256):
+    """Build a BloomFilter from all address files in a directory. Returns (BloomFilter, address_count)."""
+    database = BloomFilter(size_in_mb=size_in_mb)
+    count = 0
+    files = [f for f in os.listdir(address_dir) if os.path.isfile(os.path.join(address_dir, f))]
+    total_bytes = sum(os.path.getsize(os.path.join(address_dir, f)) for f in files) or 1
+    bytes_read = 0
+    for filename in files:
+        file_path = os.path.join(address_dir, filename)
+        with open(file_path) as file:
+            for address in file:
+                address = address.strip()
+                if address.startswith('1'):
+                    database.add(address)
+                    count += 1
+        bytes_read += os.path.getsize(file_path)
+        sys.stdout.write(f"\rProgress: {bytes_read / total_bytes * 100:.2f}%")
+        sys.stdout.flush()
+    return database, count
+
+def run_build_bloom(args):
+    """CLI handler for build-bloom: read addresses from --address-dir, write to --out or --bloom-file."""
+    address_dir = args.address_dir
+    out_path = args.out or args.bloom_file
+    if not address_dir or not os.path.isdir(address_dir):
+        print('Error: --address-dir is required and must be an existing directory.')
+        sys.exit(-1)
+    print(f'Building bloom from {address_dir}...')
+    database, count = build_bloom_from_address_dir(address_dir, size_in_mb=256)
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    database.save(out_path)
+    print(f'\nSaved to {out_path}')
+    print('database size: ' + str(count))
+
+def cpu_producer(queue, args):
+    """Producer: generates keys via point addition and puts (private_key_int, public_key_bytes) into queue."""
     private_key_int = int.from_bytes(os.urandom(32), 'big')
-    
-    # Calculate the initial Public Key
     current_key = CCPrivateKey(private_key_int.to_bytes(32, 'big'))
     current_pub_key = current_key.public_key
-
     while True:
-        # Get compressed bytes for hashing
         public_key_bytes = current_pub_key.format(compressed=True)
-        
-        # Generate Address
-        address = public_key_to_address(public_key_bytes)
+        try:
+            queue.put((private_key_int, public_key_bytes), block=True, timeout=3600)
+        except Exception:
+            break
+        current_pub_key = CCPublicKey.combine_keys([current_pub_key, GENERATOR_PUBLIC_KEY])
+        private_key_int += 1
 
-        if args['verbose']:
+def write_hit(output_path, private_key_hex, wif, public_key_hex, address):
+    """Append a verified hit to output_path. If path ends with .csv, write CSV row (with header if new file)."""
+    is_csv = output_path.lower().endswith('.csv')
+    with open(output_path, 'a') as f:
+        if is_csv:
+            if f.tell() == 0:
+                f.write('hex_private_key,wif_private_key,public_key,address\n')
+            f.write(f'{private_key_hex},{wif},{public_key_hex},{address}\n')
+        else:
+            f.write('hex private key: ' + private_key_hex + '\n' +
+                    'WIF private key: ' + wif + '\n' +
+                    'public key: ' + public_key_hex + '\n' +
+                    'address: ' + address + '\n\n')
+
+def consumer(database, queue, args, counter):
+    """Consumer: pops (private_key_int, public_key_bytes) from queue, derives address, checks bloom, verifies on hit."""
+    local_counter = 0
+    output_path = args.get('output', 'plutus.txt')
+    while True:
+        try:
+            private_key_int, public_key_bytes = queue.get(block=True, timeout=3600)
+        except Exception:
+            break
+        address = public_key_to_address(public_key_bytes)
+        if args.get('verbose'):
             print(address)
         else:
             local_counter += 1
@@ -111,31 +212,63 @@ def main(database, args, counter):
                 with counter.get_lock():
                     counter.value += local_counter
                 local_counter = 0
-        
-        # Check Bloom Filter
         if address in database:
-            # Convert our int tracker back to hex for the log/check
             private_key_hex = hex(private_key_int)[2:].zfill(64).upper()
-            
+            wif = str(private_key_to_wif(private_key_hex, compressed=True))
+            public_key_hex = public_key_bytes.hex().upper()
+            address_dir = args.get('address_dir') or ''
             found = False
-            for filename in os.listdir(DATABASE):
-                with open(DATABASE + filename) as file:
-                    if address in file.read():
-                        found = True
-                        with open('plutus.txt', 'a') as plutus:
-                            plutus.write('hex private key: ' + private_key_hex + '\n' +
-                                         'WIF private key: ' + str(private_key_to_wif(private_key_hex, compressed=True)) + '\n' +
-                                         'public key: ' + public_key_bytes.hex().upper() + '\n' +
-                                         'address: ' + str(address) + '\n\n')
-                        break
+            if address_dir and os.path.isdir(address_dir):
+                for filename in os.listdir(address_dir):
+                    file_path = os.path.join(address_dir, filename)
+                    if os.path.isfile(file_path):
+                        with open(file_path) as file:
+                            if address in file.read():
+                                found = True
+                                write_hit(output_path, private_key_hex, wif, public_key_hex, address)
+                                break
             if found:
                 print(f"FOUND: {address}")
 
-        # SHORTCUT: Point Addition
-        # Instead of generating a new key from scratch, we add G to the current point Pub(k+1) = Pub(k) + G
+def main(database, args, counter):
+    """Legacy CPU-only worker: generates keys and checks bloom in one process (used when --no-gpu with old-style spawn)."""
+    local_counter = 0
+    private_key_int = int.from_bytes(os.urandom(32), 'big')
+    current_key = CCPrivateKey(private_key_int.to_bytes(32, 'big'))
+    current_pub_key = current_key.public_key
+
+    while True:
+        public_key_bytes = current_pub_key.format(compressed=True)
+        address = public_key_to_address(public_key_bytes)
+
+        if args.get('verbose'):
+            print(address)
+        else:
+            local_counter += 1
+            if local_counter >= 1000:
+                with counter.get_lock():
+                    counter.value += local_counter
+                local_counter = 0
+
+        if address in database:
+            private_key_hex = hex(private_key_int)[2:].zfill(64).upper()
+            wif = str(private_key_to_wif(private_key_hex, compressed=True))
+            public_key_hex = public_key_bytes.hex().upper()
+            address_dir = args.get('address_dir') or ''
+            found = False
+            if address_dir and os.path.isdir(address_dir):
+                for filename in os.listdir(address_dir):
+                    file_path = os.path.join(address_dir, filename)
+                    if os.path.isfile(file_path):
+                        with open(file_path) as file:
+                            if address in file.read():
+                                found = True
+                                write_hit(args.get('output', 'plutus.txt'), private_key_hex, wif, public_key_hex, address)
+                                break
+            if found:
+                print(f"FOUND: {address}")
+
         current_pub_key = CCPublicKey.combine_keys([current_pub_key, GENERATOR_PUBLIC_KEY])
-        
-        # Keep our integer tracker in sync so we know the private key if we find a match
         private_key_int += 1
 
 def timer():
@@ -199,13 +332,20 @@ Examples:
   python3 plutus.py                   # Run with default settings
   python3 plutus.py -v 1              # Run with verbose output
   python3 plutus.py --cpu-count 4     # Run with 4 CPU cores
+  python3 plutus.py --no-gpu          # Use CPU-only key producer
   python3 plutus.py time              # Run speed test
   python3 plutus.py test              # Run brute-force logic test
+  python3 plutus.py build-bloom --address-dir /path/to/addresses --out bloom/addresses.bloom
         '''
     )
-    parser.add_argument('action', nargs='?', default='run', choices=['run', 'time', 'help', 'test'], help='Action to perform')
+    parser.add_argument('action', nargs='?', default='run', choices=['run', 'time', 'help', 'test', 'build-bloom'], help='Action to perform')
     parser.add_argument('--verbose', '-v', type=int, choices=[0, 1], default=0, help='Verbose output (0 or 1)')
     parser.add_argument('--cpu-count', '-c', type=int, default=default_cpu_count, help='Number of CPU cores')
+    parser.add_argument('--bloom-file', type=str, default=os.environ.get('BLOOM_FILE', DEFAULT_BLOOM_FILE), help='Path to bloom filter file (default: bloom/addresses.bloom or BLOOM_FILE env)')
+    parser.add_argument('--address-dir', type=str, default=None, help='Directory of address list files (for building bloom and verification on hit)')
+    parser.add_argument('--out', '-o', type=str, default=None, help='Output path for build-bloom (default: --bloom-file value)')
+    parser.add_argument('--no-gpu', action='store_true', help='Use CPU-only key producer (default: try GPU if available, else CPU)')
+    parser.add_argument('--output', type=str, default='plutus.txt', help='Path for verified hits (default: plutus.txt; use .csv for CSV output)')
 
     args = parser.parse_args()
 
@@ -219,44 +359,61 @@ Examples:
     if args.action == 'test':
         test()
 
+    if args.action == 'build-bloom':
+        run_build_bloom(args)
+        sys.exit(0)
+
     if not (0 < args.cpu_count <= multiprocessing.cpu_count()):
         print(f'Error: cpu_count must be between 1 and {multiprocessing.cpu_count()}')
         sys.exit(-1)
-    
-    print('reading database files...')
-    database = BloomFilter(256)
-    count = 0
-    
-    files = [f for f in os.listdir(DATABASE) if os.path.isfile(os.path.join(DATABASE, f))]
-    total_bytes = sum(os.path.getsize(os.path.join(DATABASE, f)) for f in files)
-    bytes_read = 0
 
-    for filename in files:
-        file_path = os.path.join(DATABASE, filename)
-        with open(file_path) as file:
-            for address in file:
-                address = address.strip()
-                if address.startswith('1'):
-                    database.add(address)
-                    count += 1
-        
-        bytes_read += os.path.getsize(file_path)
-        sys.stdout.write(f"\rProgress: {bytes_read / total_bytes * 100:.2f}%")
-        sys.stdout.flush()
+    bloom_file = args.bloom_file
+    address_dir = args.address_dir
 
-    print('\nDONE')
-    print('database size: ' + str(count))
-    print('processes spawned: ' + str(args.cpu_count))
-    
+    if os.path.isfile(bloom_file):
+        print(f'Loading bloom from {bloom_file}...')
+        database = BloomFilter.load(bloom_file)
+        print('DONE')
+        count = None
+    else:
+        if not address_dir or not os.path.isdir(address_dir):
+            print(f'Error: bloom file not found at {bloom_file} and --address-dir not provided or invalid.')
+            print('Run: python3 plutus.py build-bloom --address-dir /path/to/addresses --out ' + bloom_file)
+            sys.exit(-1)
+        print('Building bloom from address files...')
+        database, count = build_bloom_from_address_dir(address_dir, size_in_mb=256)
+        os.makedirs(os.path.dirname(bloom_file) or '.', exist_ok=True)
+        database.save(bloom_file)
+        print(f'Saved to {bloom_file}')
+        print('DONE')
+
+    if count is not None:
+        print('database size: ' + str(count))
+
     args_dict = vars(args)
+    args_dict['address_dir'] = address_dir
     counter = Value('i', 0)
-    processes = []
-    
-    for cpu in range(args.cpu_count):
-        p = multiprocessing.Process(target = main, args = (database, args_dict, counter))
-        p.start()
-        processes.append(p)
-        
+    key_queue = multiprocessing.Queue(maxsize=QUEUE_MAXSIZE)
+
+    try:
+        from plutus_gpu import gpu_producer
+    except ImportError:
+        gpu_producer = None
+
+    producer_target = gpu_producer if (not args.no_gpu and gpu_producer is not None) else cpu_producer
+    producer_label = 'GPU' if producer_target is gpu_producer else 'CPU'
+    print('consumer threads: ' + str(args.cpu_count) + ', producer: ' + producer_label)
+
+    consumer_threads = []
+    for _ in range(args.cpu_count):
+        t = threading.Thread(target=consumer, args=(database, key_queue, args_dict, counter))
+        t.daemon = True
+        t.start()
+        consumer_threads.append(t)
+
+    producer_process = multiprocessing.Process(target=producer_target, args=(key_queue, args_dict))
+    producer_process.start()
+
     if not args.verbose:
         try:
             while True:
@@ -268,5 +425,5 @@ Examples:
                 sys.stdout.flush()
         except KeyboardInterrupt:
             print("\nShutting down...")
-            for p in processes:
-                p.terminate()
+            producer_process.terminate()
+            producer_process.join(timeout=5)
