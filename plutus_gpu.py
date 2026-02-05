@@ -12,19 +12,29 @@ try:
     GENERATOR_PUBLIC_KEY = CCPrivateKey(int(1).to_bytes(32, 'big')).public_key
 
     def gpu_producer(queue, args):
-        """Producer: generates keys via point addition and puts (private_key_int, public_key_bytes) into queue.
-        Uses same key-generation loop as CPU producer; can be extended later with a CUDA kernel."""
+        """Producer: generates keys via point addition and puts batches of (private_key_int, public_key_bytes) into queue.
+        Uses same key-generation loop; can be extended later with a CUDA kernel."""
+        batch_size = args.get('batch_size', 64)
+        batch = []
         private_key_int = int.from_bytes(os.urandom(32), 'big')
         current_key = CCPrivateKey(private_key_int.to_bytes(32, 'big'))
         current_pub_key = current_key.public_key
         while True:
             public_key_bytes = current_pub_key.format(compressed=True)
-            try:
-                queue.put((private_key_int, public_key_bytes), block=True, timeout=3600)
-            except Exception:
-                break
+            batch.append((private_key_int, public_key_bytes))
+            if len(batch) >= batch_size:
+                try:
+                    queue.put(batch, block=True, timeout=3600)
+                except Exception:
+                    break
+                batch = []
             current_pub_key = CCPublicKey.combine_keys([current_pub_key, GENERATOR_PUBLIC_KEY])
             private_key_int += 1
+        if batch:
+            try:
+                queue.put(batch, block=True, timeout=3600)
+            except Exception:
+                pass
 
 except Exception:
     gpu_producer = None

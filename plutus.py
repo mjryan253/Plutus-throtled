@@ -16,6 +16,7 @@ import argparse
 
 DEFAULT_BLOOM_FILE = 'bloom/addresses.bloom'
 QUEUE_MAXSIZE = 50000
+BATCH_SIZE = 64
 ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 BLOOM_MAGIC = b'PLUTUS_BLOOM_v1'
 BLOOM_MAGIC_LEGACY = b'PLUTBLOM'  # 8-byte legacy magic (older/alternate format)
@@ -181,40 +182,43 @@ def write_hit(output_path, private_key_hex, wif, public_key_hex, address):
                     'address: ' + address + '\n\n')
 
 def consumer(database, queue, args, counter):
-    """Consumer: pops (private_key_int, public_key_bytes) from queue, derives address, checks bloom, verifies on hit."""
+    """Consumer: pops batches of (private_key_int, public_key_bytes) from queue, derives address, checks bloom, verifies on hit."""
     local_counter = 0
     output_path = args.get('output', 'plutus.txt')
     while True:
         try:
-            private_key_int, public_key_bytes = queue.get(block=True, timeout=3600)
+            batch = queue.get(block=True, timeout=3600)
         except Exception:
             break
-        address = public_key_to_address(public_key_bytes)
-        if args.get('verbose'):
-            print(address)
-        else:
-            local_counter += 1
-            if local_counter >= 1000:
-                with counter.get_lock():
-                    counter.value += local_counter
-                local_counter = 0
-        if address in database:
-            private_key_hex = hex(private_key_int)[2:].zfill(64).upper()
-            wif = str(private_key_to_wif(private_key_hex, compressed=True))
-            public_key_hex = public_key_bytes.hex().upper()
-            address_dir = args.get('address_dir') or ''
-            found = False
-            if address_dir and os.path.isdir(address_dir):
-                for filename in os.listdir(address_dir):
-                    file_path = os.path.join(address_dir, filename)
-                    if os.path.isfile(file_path):
-                        with open(file_path) as file:
-                            if address in file.read():
-                                found = True
-                                write_hit(output_path, private_key_hex, wif, public_key_hex, address)
-                                break
-            if found:
-                print(f"FOUND: {address}")
+        if not isinstance(batch, list):
+            batch = [batch]
+        for private_key_int, public_key_bytes in batch:
+            address = public_key_to_address(public_key_bytes)
+            if args.get('verbose'):
+                print(address)
+            else:
+                local_counter += 1
+                if local_counter >= 1000:
+                    with counter.get_lock():
+                        counter.value += local_counter
+                    local_counter = 0
+            if address in database:
+                private_key_hex = hex(private_key_int)[2:].zfill(64).upper()
+                wif = str(private_key_to_wif(private_key_hex, compressed=True))
+                public_key_hex = public_key_bytes.hex().upper()
+                address_dir = args.get('address_dir') or ''
+                found = False
+                if address_dir and os.path.isdir(address_dir):
+                    for filename in os.listdir(address_dir):
+                        file_path = os.path.join(address_dir, filename)
+                        if os.path.isfile(file_path):
+                            with open(file_path) as file:
+                                if address in file.read():
+                                    found = True
+                                    write_hit(output_path, private_key_hex, wif, public_key_hex, address)
+                                    break
+                if found:
+                    print(f"FOUND: {address}")
 
 def timer():
     start = time.time()
@@ -336,6 +340,7 @@ Examples:
 
     args_dict = vars(args)
     args_dict['address_dir'] = address_dir
+    args_dict['batch_size'] = BATCH_SIZE
     counter = Value('i', 0)
     key_queue = multiprocessing.Queue(maxsize=QUEUE_MAXSIZE)
 
@@ -383,7 +388,7 @@ Examples:
             if proc is None:
                 missing.append('psutil (CPU%)')
             if nvml_handle is None:
-                missing.append('pynvml (GPU)')
+                missing.append('nvidia-ml-py (GPU)')
             print('Note: for full --stats, install: ' + ', '.join(missing))
 
     if not args.verbose:

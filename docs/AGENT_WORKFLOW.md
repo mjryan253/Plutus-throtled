@@ -69,3 +69,11 @@ Append below: date, what was done, and any new decisions or troubleshooting note
 - **Runtime evidence** (`.cursor/debug.log`): `psutil` and `pynvml` not installed → `proc_is_none`: True, `nvml_handle_is_none`: True; segments built were `['Speed: ...', 'queue: 50000']` with no thread count or CPU/GPU.
 - **Fix**: (1) Added `threads: N` to the status line when `--stats` (N = consumer thread count from `args.cpu_count`) so the number of CPU threads checking keys is visible without extra deps. (2) When `--stats` is used but psutil or pynvml is missing, print a one-time note: “For full --stats, install: psutil (CPU%), pynvml (GPU).”
 - **Outcome**: Post-fix log showed `segments`: `['Speed: 10000 keys/sec', 'threads: 7', 'queue: 50000']`. Instrumentation removed after verification.
+
+### Implementation: Producer/consumer efficiency, nvidia-ml-py (2025-02-04)
+
+- **Done**:
+  1. **Batch queue protocol**: Producer ([plutus_gpu.py](plutus_gpu.py)) accumulates keys in a list (batch size 64); when full, `queue.put(batch)`. Consumer ([plutus.py](plutus.py)) `queue.get()` returns a list; loop over batch and process each key (address + bloom). Reduces queue lock traffic. `BATCH_SIZE = 64` in plutus.py; passed via `args_dict['batch_size']`. Consumer accepts single-item batches for compatibility (`if not isinstance(batch, list): batch = [batch]`).
+  2. **pynvml → nvidia-ml-py**: Replaced `pynvml` with `nvidia-ml-py` in [requirements.txt](requirements.txt). GPU stats in plutus.py still use `import pynvml` (nvidia-ml-py exposes the pynvml module). Updated “missing” note to “nvidia-ml-py (GPU)” so the deprecation warning goes away when the new package is installed.
+  3. **Future work**: Real GPU key generation (CUDA kernel for secp256k1 point addition) is left as a separate, optional project; current producer remains CPU-bound (coincurve) in a separate process.
+- **Decisions**: Batch size 64; queue still holds up to QUEUE_MAXSIZE items (now batches). Optional faster secp256k1 library or CUDA key gen can be added later.
